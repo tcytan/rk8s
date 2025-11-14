@@ -98,6 +98,7 @@ pub enum ResourceKind {
     Service,
     Deployment,
     ReplicaSet,
+    Endpoint,
     #[default]
     Unknown,
 }
@@ -109,6 +110,7 @@ impl fmt::Display for ResourceKind {
             ResourceKind::Service => "Service",
             ResourceKind::Deployment => "Deployment",
             ResourceKind::ReplicaSet => "ReplicaSet",
+            ResourceKind::Endpoint => "Endpoint",
             ResourceKind::Unknown => "Unknown",
         };
         write!(f, "{}", kind)
@@ -122,6 +124,7 @@ impl From<&str> for ResourceKind {
             "Service" => ResourceKind::Service,
             "Deployment" => ResourceKind::Deployment,
             "ReplicaSet" => ResourceKind::ReplicaSet,
+            "Endpoint" => ResourceKind::Endpoint,
             _ => ResourceKind::Unknown, // Default to Unknown for unknown kinds
         }
     }
@@ -866,7 +869,7 @@ pub struct ServiceSpec {
     #[serde(rename = "type", default = "default_service_type")]
     pub service_type: String, // ClusterIP, NodePort, LoadBalancer
     #[serde(default)]
-    pub selector: HashMap<String, String>,
+    pub selector: Option<LabelSelector>,
     #[serde(default)]
     pub ports: Vec<ServicePort>,
     #[serde(rename = "clusterIP", default)]
