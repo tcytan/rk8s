@@ -868,6 +868,10 @@ pub struct ExternalInterface {
 pub struct ServiceSpec {
     #[serde(rename = "type", default = "default_service_type")]
     pub service_type: String, // ClusterIP, NodePort, LoadBalancer
+    /// **BREAKING CHANGE**: The `selector` field type changed from `HashMap<String, String>` to `Option<LabelSelector>`.
+    /// This aligns with Kubernetes API semantics and allows for match expressions.
+    /// All code accessing `svc.spec.selector` must be updated to handle `Option<LabelSelector>`.
+    /// See release notes for migration details.
     #[serde(default)]
     pub selector: Option<LabelSelector>,
     #[serde(default)]

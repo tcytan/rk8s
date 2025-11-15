@@ -15,7 +15,8 @@ use rks::{
 };
 use serial_test::serial;
 use tokio::sync::RwLock;
-use tokio::time::{Duration, Instant, sleep};
+use tokio::time::sleep;
+use tokio::time::{Duration, Instant};
 
 fn init_logging() {
     static LOGGER: OnceCell<()> = OnceCell::new();
@@ -514,8 +515,7 @@ async fn test_update_while_processing_applies_latest() -> Result<()> {
     }
     let store = store.unwrap();
     clean_store(&store).await?;
-
-    // Service matches all pods; we add two pods within debounce window
+    // Service matches all pods; we add one pod, wait for debounce to expire, then add another pod.
     let selector = LabelSelector {
         match_labels: HashMap::new(),
         match_expressions: vec![],
@@ -533,13 +533,11 @@ async fn test_update_while_processing_applies_latest() -> Result<()> {
     store
         .insert_pod_yaml(&pod1.metadata.name, &serde_yaml::to_string(&pod1)?)
         .await?;
-    // insert second within debounce window so both coalesce into one processing
     sleep(Duration::from_millis(200)).await;
     store
         .insert_pod_yaml(&pod2.metadata.name, &serde_yaml::to_string(&pod2)?)
         .await?;
 
-    // Expect both IPs present after one processing cycle
     wait_for_endpoints_ips(
         &store,
         "svc-dedupe",

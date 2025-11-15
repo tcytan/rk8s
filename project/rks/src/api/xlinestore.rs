@@ -395,7 +395,7 @@ impl XlineStore {
         Ok(())
     }
 
-    pub async fn get_service_yaml(&self, endpoint_name: &str) -> Result<Option<String>> {
+    pub async fn get_endpoint_yaml(&self, endpoint_name: &str) -> Result<Option<String>> {
         let key = format!("/registry/endpoints/{endpoint_name}");
         let mut client = self.client.write().await;
         let resp = client.get(key, None).await?;
@@ -405,7 +405,7 @@ impl XlineStore {
             .map(|kv| String::from_utf8_lossy(kv.value()).to_string()))
     }
 
-    /// Delete an endpoints entry from xline.
+    /// Delete an endpoint entry from xline.
     pub async fn delete_endpoint(&self, endpoint_name: &str) -> Result<()> {
         let key = format!("/registry/endpoints/{endpoint_name}");
         let mut client = self.client.write().await;
@@ -413,8 +413,8 @@ impl XlineStore {
         Ok(())
     }
 
-    /// Get a endpoint YAML definition from xline.
-    pub async fn get_endpoint_yaml(&self, service_name: &str) -> Result<Option<String>> {
+    /// Get a service YAML definition from xline.
+    pub async fn get_service_yaml(&self, service_name: &str) -> Result<Option<String>> {
         let key = format!("/registry/services/{service_name}");
         let mut client = self.client.write().await;
         let resp = client.get(key, None).await?;

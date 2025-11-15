@@ -202,7 +202,10 @@ impl EndpointController {
                             *cnt += 1;
                             if *cnt <= max_retries_c {
                                 // exponential backoff: base 200ms
-                                let backoff = 200u64.saturating_mul(2u64.saturating_pow(*cnt));
+                                // cap backoff to a reasonable maximum (30s) to avoid
+                                // extremely long waits when max_retries is large.
+                                let backoff =
+                                    200u64.saturating_mul(2u64.saturating_pow(*cnt)).min(30_000);
                                 let tx_retry = tx_c.clone();
                                 let key_retry = key_cl.clone();
                                 warn!(
@@ -234,6 +237,11 @@ impl EndpointController {
                         };
 
                         if had_dirty {
+                            let mut at = attempts_c.lock().await;
+                            if at.remove(&key_cl).is_some() {
+                                info!("reset attempts due to dirty requeue service={key_cl}");
+                            }
+
                             // requeue to process latest changes (no extra delay)
                             info!("requeue due to dirty service={key_cl}");
                             schedule_enqueue(
@@ -252,6 +260,16 @@ impl EndpointController {
         }
     }
 
+    /// Reconcile a Service by name.
+    ///
+    /// NOTE: This helper is not currently invoked by the controller runtime but
+    /// is retained intentionally as a convenient entry point for manual
+    /// reconciliation, debugging, or unit tests that may want to exercise the
+    /// same logic using the controller's store/caches. If you remove it, please
+    /// ensure any tests or external callers are updated accordingly.
+    ///
+    /// Keep `allow(dead_code)` to suppress unused warnings while the method is
+    /// kept for future use; remove the attribute if the function is deleted.
     #[allow(dead_code)]
     async fn reconcile_service(&self, svc_name: &str) -> Result<()> {
         // Try to get the service; if missing, create an empty Endpoints object
@@ -507,15 +525,6 @@ impl Controller for EndpointController {
                         if let Ok(svc) = serde_yaml::from_str::<ServiceTask>(yaml) {
                             let name = svc.metadata.name.clone();
                             self.service_index.write().await.insert(name.clone(), svc);
-                            // if currently processing, mark dirty; otherwise enqueue
-                            // let in_flight = self.processing.read().await.contains(&name);
-                            // if in_flight {
-                            //     self.dirty.write().await.insert(name.clone());
-                            //     info!("service update while processing (mark dirty) service={name}");
-                            // } else {
-                            //     schedule_enqueue(&self.queue_tx, self.queued.clone(), self.dirty.clone(), self.processing.clone(), name.clone(), Duration::from_millis(0)).await;
-                            //     info!("service add/update enqueue service={name}");
-                            // }
                             info!("service add/update enqueue service={name}");
                             schedule_enqueue(
                                 &self.queue_tx,
@@ -560,14 +569,6 @@ impl Controller for EndpointController {
                                 };
                                 if matched {
                                     let svc_name = svc.metadata.name.clone();
-                                    //let in_flight = self.processing.read().await.contains(&svc_name);
-                                    // if in_flight {
-                                    //     info!("pod triggers dirty (in-flight) service={svc_name} pod={pod_name}");
-                                    //     self.dirty.write().await.insert(svc_name.clone());
-                                    // } else {
-                                    //     schedule_enqueue(&self.queue_tx, self.queued.clone(), self.dirty.clone(), self.processing.clone(),svc_name.clone(), Duration::from_millis(200)).await;
-                                    //     info!("pod triggers enqueue (debounce) service={svc_name} pod={pod_name}");
-                                    // }
                                     info!(
                                         "pod triggers enqueue (debounce) service={svc_name} pod={pod_name}"
                                     );
@@ -594,14 +595,6 @@ impl Controller for EndpointController {
                         if let Ok(svc) = serde_yaml::from_str::<ServiceTask>(yaml) {
                             let name = svc.metadata.name.clone();
                             self.service_index.write().await.remove(&name);
-                            //let in_flight = self.processing.read().await.contains(&name);
-                            // if in_flight {
-                            //     self.dirty.write().await.insert(name);
-                            //     info!("service delete while processing (mark dirty) service={}", svc.metadata.name);
-                            // } else {
-                            //             schedule_enqueue(&self.queue_tx, self.queued.clone(), self.dirty.clone(), self.processing.clone(),name, Duration::from_millis(0)).await;
-                            //     info!("service delete enqueue service={}", svc.metadata.name);
-                            // }
                             info!("service delete enqueue service={}", svc.metadata.name);
                             schedule_enqueue(
                                 &self.queue_tx,
@@ -640,14 +633,6 @@ impl Controller for EndpointController {
                                 };
                                 if matched {
                                     let svc_name = svc.metadata.name.clone();
-                                    // let in_flight = self.processing.read().await.contains(&svc_name);
-                                    // if in_flight {
-                                    //     self.dirty.write().await.insert(svc_name.clone());
-                                    //     info!("pod delete triggers dirty (in-flight) service={} pod={}", svc_name, pod.metadata.name);
-                                    // } else {
-                                    //             schedule_enqueue(&self.queue_tx, self.queued.clone(), self.dirty.clone(),self.processing.clone(), svc_name.clone(), Duration::from_millis(200)).await;
-                                    //     info!("pod delete triggers enqueue service={} pod={}", svc_name, pod.metadata.name);
-                                    // }
                                     info!(
                                         "pod delete triggers enqueue service={} pod={}",
                                         svc_name, pod.metadata.name
