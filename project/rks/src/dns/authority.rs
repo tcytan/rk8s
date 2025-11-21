@@ -702,7 +702,7 @@ fn parse_srv_query(
     Some((port_name, proto, svc, ns))
 }
 
-/// Ensure `ip nat` table and `PREROUTING` chain exist
+/// Ensure `nat` table in the ip family and `PREROUTING` chain exist
 pub async fn ensure_nat_prerouting_chain() -> Result<()> {
     let current = tokio::task::spawn_blocking(nft_helper::get_current_ruleset)
         .await
@@ -758,6 +758,7 @@ pub async fn ensure_nat_prerouting_chain() -> Result<()> {
 }
 
 pub async fn setup_dns_nftable(dns_ip: String, dns_port: u16) -> anyhow::Result<()> {
+    ensure_nat_prerouting_chain().await?;
     let br_name = env::var("BR_NAME").unwrap_or_else(|_| "cni0".to_string());
     // Construct nftables Rule objects (no raw CLI strings). We create four
     // rules and add them via the nftables JSON API helper.
@@ -810,62 +811,148 @@ pub async fn setup_dns_nftable(dns_ip: String, dns_port: u16) -> anyhow::Result<
     // (iifname) for UDP and TCP port 53 -> redirect to local :port
     let mut objects: Vec<NfObject> = Vec::new();
 
-    for proto in ["udp", "tcp"] {
-        let rule = Rule {
-            family: NfFamily::IP,
-            table: Cow::Owned("nat".to_string()),
-            chain: Cow::Owned("PREROUTING".to_string()),
-            comment: Some(Cow::Owned("rk8s-dns-redirect".to_string())),
-            expr: Cow::Owned(vec![
-                iif_match(br.clone()),
-                proto_match(proto),
-                dport_match(proto, 53),
-                Statement::Redirect(Some(NAT {
-                    addr: None,
-                    family: None,
-                    port: Some(Expression::Number(port as u32)),
-                    flags: None,
-                })),
-            ]),
-            ..Default::default()
-        };
+    // Ensure a clean base: delete any existing rules with our comment, then re-add
+    let current = tokio::task::spawn_blocking(nft_helper::get_current_ruleset)
+        .await
+        .map_err(|e| anyhow::anyhow!(format!("failed to run nft helper task: {e}")))?;
 
-        objects.push(NfObject::CmdObject(NfCmd::Add(NfListObject::Rule(rule))));
+    if let Ok(ruleset) = current {
+        let mut delete_objects: Vec<NfObject> = Vec::new();
+        for obj in ruleset.objects.iter() {
+            if let NfObject::ListObject(listobj) = obj
+                && let NfListObject::Rule(r) = listobj
+                && let Some(comment) = &r.comment
+                && comment == "rk8s-dns-redirect"
+            {
+                let del_rule = Rule {
+                    family: r.family,
+                    table: r.table.clone(),
+                    chain: r.chain.clone(),
+                    handle: r.handle,
+                    expr: r.expr.clone(),
+                    ..Default::default()
+                };
+                delete_objects.push(NfObject::CmdObject(NfCmd::Delete(NfListObject::Rule(
+                    del_rule,
+                ))));
+            }
+        }
+
+        if !delete_objects.is_empty() {
+            let to_delete = Nftables {
+                objects: std::borrow::Cow::Owned(delete_objects),
+            };
+
+            tokio::task::spawn_blocking(move || nft_helper::apply_ruleset(&to_delete))
+                .await
+                .map_err(|e| anyhow::anyhow!(format!("failed to run nft helper task: {e}")))?
+                .map_err(|e| {
+                    anyhow::anyhow!(format!("failed to delete existing nftables rules: {e}"))
+                })?;
+        }
     }
 
-    // Build DNAT rules for packets whose ip daddr == dns_ip and dport 53
-    for proto in ["udp", "tcp"] {
-        let ip_match = Statement::Match(StmtMatch {
-            left: Expression::Named(NamedExpression::Payload(Payload::PayloadField(
-                PayloadField {
-                    protocol: Cow::Owned("ip".to_string()),
-                    field: Cow::Owned("daddr".to_string()),
-                },
-            ))),
-            op: Operator::EQ,
-            right: Expression::String(Cow::Owned(ip.clone())),
-        });
+    // Recreate the 4 rules unconditionally (redirect UDP/TCP and DNAT UDP/TCP)
 
-        let rule = Rule {
-            family: NfFamily::IP,
-            table: Cow::Owned("nat".to_string()),
-            chain: Cow::Owned("PREROUTING".to_string()),
-            comment: Some(Cow::Owned("rk8s-dns-redirect".to_string())),
-            expr: Cow::Owned(vec![
-                ip_match,
-                dport_match(proto, 53),
-                Statement::DNAT(Some(NAT {
-                    addr: Some(Expression::String(Cow::Owned(ip.clone()))),
-                    family: Some(NATFamily::IP),
-                    port: Some(Expression::Number(port as u32)),
-                    flags: None,
-                })),
-            ]),
-            ..Default::default()
-        };
+    // Redirect UDP
+    let rule_udp_redirect = Rule {
+        family: NfFamily::IP,
+        table: Cow::Owned("nat".to_string()),
+        chain: Cow::Owned("PREROUTING".to_string()),
+        comment: Some(Cow::Owned("rk8s-dns-redirect".to_string())),
+        expr: Cow::Owned(vec![
+            iif_match(br.clone()),
+            proto_match("udp"),
+            dport_match("udp", 53),
+            Statement::Redirect(Some(NAT {
+                addr: None,
+                family: None,
+                port: Some(Expression::Number(port as u32)),
+                flags: None,
+            })),
+        ]),
+        ..Default::default()
+    };
+    objects.push(NfObject::CmdObject(NfCmd::Add(NfListObject::Rule(
+        rule_udp_redirect,
+    ))));
 
-        objects.push(NfObject::CmdObject(NfCmd::Add(NfListObject::Rule(rule))));
-    }
+    // Redirect TCP
+    let rule_tcp_redirect = Rule {
+        family: NfFamily::IP,
+        table: Cow::Owned("nat".to_string()),
+        chain: Cow::Owned("PREROUTING".to_string()),
+        comment: Some(Cow::Owned("rk8s-dns-redirect".to_string())),
+        expr: Cow::Owned(vec![
+            iif_match(br.clone()),
+            proto_match("tcp"),
+            dport_match("tcp", 53),
+            Statement::Redirect(Some(NAT {
+                addr: None,
+                family: None,
+                port: Some(Expression::Number(port as u32)),
+                flags: None,
+            })),
+        ]),
+        ..Default::default()
+    };
+    objects.push(NfObject::CmdObject(NfCmd::Add(NfListObject::Rule(
+        rule_tcp_redirect,
+    ))));
+
+    // DNAT rules (UDP/TCP)
+    let ip_match = Statement::Match(StmtMatch {
+        left: Expression::Named(NamedExpression::Payload(Payload::PayloadField(
+            PayloadField {
+                protocol: Cow::Owned("ip".to_string()),
+                field: Cow::Owned("daddr".to_string()),
+            },
+        ))),
+        op: Operator::EQ,
+        right: Expression::String(Cow::Owned(ip.clone())),
+    });
+
+    let rule_udp_dnat = Rule {
+        family: NfFamily::IP,
+        table: Cow::Owned("nat".to_string()),
+        chain: Cow::Owned("PREROUTING".to_string()),
+        comment: Some(Cow::Owned("rk8s-dns-redirect".to_string())),
+        expr: Cow::Owned(vec![
+            ip_match.clone(),
+            dport_match("udp", 53),
+            Statement::DNAT(Some(NAT {
+                addr: Some(Expression::String(Cow::Owned(ip.clone()))),
+                family: Some(NATFamily::IP),
+                port: Some(Expression::Number(port as u32)),
+                flags: None,
+            })),
+        ]),
+        ..Default::default()
+    };
+    objects.push(NfObject::CmdObject(NfCmd::Add(NfListObject::Rule(
+        rule_udp_dnat,
+    ))));
+
+    let rule_tcp_dnat = Rule {
+        family: NfFamily::IP,
+        table: Cow::Owned("nat".to_string()),
+        chain: Cow::Owned("PREROUTING".to_string()),
+        comment: Some(Cow::Owned("rk8s-dns-redirect".to_string())),
+        expr: Cow::Owned(vec![
+            ip_match,
+            dport_match("tcp", 53),
+            Statement::DNAT(Some(NAT {
+                addr: Some(Expression::String(Cow::Owned(ip.clone()))),
+                family: Some(NATFamily::IP),
+                port: Some(Expression::Number(port as u32)),
+                flags: None,
+            })),
+        ]),
+        ..Default::default()
+    };
+    objects.push(NfObject::CmdObject(NfCmd::Add(NfListObject::Rule(
+        rule_tcp_dnat,
+    ))));
 
     let to_apply = Nftables {
         objects: std::borrow::Cow::Owned(objects),
@@ -878,7 +965,7 @@ pub async fn setup_dns_nftable(dns_ip: String, dns_port: u16) -> anyhow::Result<
 
     match res {
         Ok(()) => {
-            info!("Applied nftables rules for DNS redirect/ DNAT");
+            info!("Applied nftables rules for DNS redirect/DNAT");
             Ok(())
         }
         Err(e) => Err(anyhow::anyhow!("failed to apply nftables rules: {e}")),
@@ -887,7 +974,7 @@ pub async fn setup_dns_nftable(dns_ip: String, dns_port: u16) -> anyhow::Result<
 
 #[allow(dead_code)]
 pub async fn cleanup_dns_nftable() -> anyhow::Result<()> {
-    // Identify rules previously added by `setup_iptable` by their comment
+    // Identify rules previously added by `setup_dns_nftable` by their comment
     // `rk8s-dns-redirect`, obtain handles, and delete them using the nft JSON API.
     let current = tokio::task::spawn_blocking(nft_helper::get_current_ruleset)
         .await
@@ -930,14 +1017,9 @@ pub async fn cleanup_dns_nftable() -> anyhow::Result<()> {
         objects: std::borrow::Cow::Owned(delete_objects),
     };
 
-    let payload = serde_json::to_string(&to_apply)
-        .map_err(|e| anyhow::anyhow!("failed to serialize delete payload: {e}"))?;
-
-    let res = tokio::task::spawn_blocking(move || {
-        nft_helper::apply_ruleset_raw(&payload, nft_helper::DEFAULT_NFT, nft_helper::DEFAULT_ARGS)
-    })
-    .await
-    .map_err(|e| anyhow::anyhow!("failed to run nft helper task: {e}"))?;
+    let res = tokio::task::spawn_blocking(move || nft_helper::apply_ruleset(&to_apply))
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to run nft helper task: {e}"))?;
 
     match res {
         Ok(_) => {

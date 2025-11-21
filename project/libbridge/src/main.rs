@@ -788,12 +788,53 @@ pub async fn setup_bridge_nftable(br_name: String) -> anyhow::Result<()> {
         NfObject::CmdObject(NfCmd::Add(NfListObject::Rule(r)))
     };
 
-    // ext_iface -> br
+    // Ensure a clean base: delete any existing rules with our comment, then re-add
+    let mut delete_objects: Vec<NfObject> = Vec::new();
+    for obj in current.objects.iter() {
+        if let NfObject::ListObject(listobj) = obj
+            && let NfListObject::Rule(r) = listobj
+            && let Some(comment) = &r.comment
+            && comment == "libbridge-forward-accept"
+        {
+            let del_rule = Rule {
+                family: r.family,
+                table: r.table.clone(),
+                chain: r.chain.clone(),
+                handle: r.handle,
+                expr: r.expr.clone(),
+                ..Default::default()
+            };
+            delete_objects.push(NfObject::CmdObject(NfCmd::Delete(NfListObject::Rule(
+                del_rule,
+            ))));
+        }
+    }
+
+    if !delete_objects.is_empty() {
+        let to_delete = Nftables {
+            objects: Cow::Owned(delete_objects),
+        };
+        let payload = serde_json::to_string(&to_delete)
+            .map_err(|e| anyhow::anyhow!(format!("failed to serialize delete payload: {e}")))?;
+
+        tokio::task::spawn_blocking(move || {
+            nft_helper::apply_ruleset_raw(
+                &payload,
+                nft_helper::DEFAULT_NFT,
+                nft_helper::DEFAULT_ARGS,
+            )
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!(format!("failed to run nft helper task: {e}")))?
+        .map_err(|e| anyhow::anyhow!(format!("failed to delete existing nftables rules: {e}")))?;
+    }
+
+    // ext_iface -> br (recreate)
     objects.push(build_accept_rule(
         ext_iface.iface.name.clone(),
         br_name.clone(),
     ));
-    // br -> ext_iface
+    // br -> ext_iface (recreate)
     objects.push(build_accept_rule(
         br_name.clone(),
         ext_iface.iface.name.clone(),
@@ -855,17 +896,12 @@ pub async fn cleanup_bridge_nftable() -> anyhow::Result<()> {
         objects: Cow::Owned(delete_objects),
     };
 
-    let payload = serde_json::to_string(&to_apply)
-        .map_err(|e| anyhow::anyhow!("failed to serialize delete payload: {e}"))?;
-
-    let res = tokio::task::spawn_blocking(move || {
-        nft_helper::apply_ruleset_raw(&payload, nft_helper::DEFAULT_NFT, nft_helper::DEFAULT_ARGS)
-    })
-    .await
-    .map_err(|e| anyhow::anyhow!("failed to run nft helper task: {e}"))?;
+    let res = tokio::task::spawn_blocking(move || nft_helper::apply_ruleset(&to_apply))
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to run nft helper task: {e}"))?;
 
     match res {
-        Ok(_) => Ok(()),
+        Ok(()) => Ok(()),
         Err(e) => Err(anyhow::anyhow!("failed to delete nftables rules: {e}")),
     }
 }
