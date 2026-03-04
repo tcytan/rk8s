@@ -19,6 +19,7 @@ pub mod cert;
 mod dispatch;
 mod heartbeat;
 mod lease_sync;
+mod local_node;
 mod register;
 mod server;
 mod watcher;
@@ -112,13 +113,13 @@ impl RksNode {
     pub async fn run(self) -> anyhow::Result<()> {
         info!("Starting server with address: {}", self.addr);
 
-        self.start_background_tasks();
+        self.start_background_tasks().await;
 
         let server = QUICServer::new(self.addr.parse()?, self.shared.vault.clone()).await?;
         server.serve(self.shared.clone()).await
     }
 
-    fn start_background_tasks(&self) {
+    async fn start_background_tasks(&self) {
         // Check if lastheartbeattime times out
         heartbeat::watch(
             self.shared.xline_store.clone(),
@@ -126,6 +127,12 @@ impl RksNode {
             Duration::from_secs(10), // interval
         );
         info!("Heartbeat monitor started");
+
+        if let Err(e) = local_node::bootstrap(self.shared.clone(), &self.addr).await {
+            warn!("Failed to bootstrap local rks node networking: {e:#}");
+        } else {
+            info!("Local rks node networking bootstrap completed");
+        }
 
         // Spawn task to propagate lease updates to workers
         LeaseSynchronizer::spawn(
