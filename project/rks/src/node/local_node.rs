@@ -4,11 +4,12 @@ use crate::node::{Shared, WorkerSession};
 use anyhow::{Context, Result};
 use common::RksMessage;
 use common::lease::LeaseAttrs;
-use ipnetwork::{IpNetwork, Ipv4Network, Ipv6Network};
-use libcni::ip::route::Route;
+use ipnetwork::{IpNetwork, Ipv4Network};
+use libcni::ip::route::{self as ip_route, Route};
 use libnetwork::ip::{PublicIPOpts, get_ip_family, lookup_ext_iface};
-use libnetwork::route::RouteManager;
+use libnetwork::route::{RouteListOps, RouteManager};
 use log::{debug, error, info, warn};
+use netlink_packet_route::AddressFamily;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 use tokio::sync::{Mutex, mpsc};
@@ -193,7 +194,6 @@ fn spawn_local_lease_completion(
 
 async fn apply_subnet_env(local_manager: Arc<LocalManager>, subnet_env: &str) -> Result<()> {
     let mut ipv4_subnet = None;
-    let mut ipv6_subnet = None;
     let mut ip_masq = true;
     let mut mtu = 1500;
 
@@ -203,11 +203,6 @@ async fn apply_subnet_env(local_manager: Arc<LocalManager>, subnet_env: &str) ->
                 "RKL_SUBNET" => {
                     ipv4_subnet = Some(value.parse::<Ipv4Network>().with_context(|| {
                         format!("invalid RKL_SUBNET value in local config: {value}")
-                    })?);
-                }
-                "RKL_IPV6_SUBNET" => {
-                    ipv6_subnet = Some(value.parse::<Ipv6Network>().with_context(|| {
-                        format!("invalid RKL_IPV6_SUBNET value in local config: {value}")
                     })?);
                 }
                 "RKL_MTU" => {
@@ -229,7 +224,7 @@ async fn apply_subnet_env(local_manager: Arc<LocalManager>, subnet_env: &str) ->
 
     let subnet_file = subnet_file_path();
     local_manager
-        .handle_subnet_file(&subnet_file, &config, ip_masq, subnet, ipv6_subnet, mtu)
+        .handle_subnet_file(&subnet_file, &config, ip_masq, subnet, None, mtu)
         .with_context(|| {
             format!(
                 "failed to write local subnet config to {}",
@@ -254,24 +249,20 @@ async fn apply_routes(route_manager: Arc<Mutex<RouteManager>>, routes: Vec<Route
     );
 
     let mut manager = route_manager.lock().await;
+    let mut desired_v4_routes = Vec::new();
 
     for route in routes {
         match &route.dst {
             Some(IpNetwork::V4(_)) => {
-                if let Err(e) = manager.add_route(&route).await {
-                    error!(
-                        target: "rks::node::local",
-                        "failed to add IPv4 route {route:?}: {e}"
-                    );
+                if !contains_route(&desired_v4_routes, &route) {
+                    desired_v4_routes.push(route);
                 }
             }
             Some(IpNetwork::V6(_)) => {
-                if let Err(e) = manager.add_v6_route(&route).await {
-                    error!(
-                        target: "rks::node::local",
-                        "failed to add IPv6 route {route:?}: {e}"
-                    );
-                }
+                debug!(
+                    target: "rks::node::local",
+                    "skip IPv6 route for local rks node: {route:?}"
+                );
             }
             None => {
                 warn!(
@@ -281,6 +272,48 @@ async fn apply_routes(route_manager: Arc<Mutex<RouteManager>>, routes: Vec<Route
             }
         }
     }
+
+    let current_v4_routes = manager.get_routes().to_vec();
+
+    let mut removed_v4 = 0usize;
+
+    for stale_route in &current_v4_routes {
+        if contains_route(&desired_v4_routes, stale_route) {
+            continue;
+        }
+
+        if let Err(e) = manager.delete_route(stale_route).await {
+            error!(
+                target: "rks::node::local",
+                "failed to remove stale IPv4 route {stale_route:?}: {e}"
+            );
+        } else {
+            manager.remove_from_route_list(stale_route, AddressFamily::Inet);
+            removed_v4 += 1;
+        }
+    }
+
+    for route in desired_v4_routes {
+        if let Err(e) = manager.add_route(&route).await {
+            error!(
+                target: "rks::node::local",
+                "failed to add IPv4 route {route:?}: {e}"
+            );
+        }
+    }
+
+    info!(
+        target: "rks::node::local",
+        "route reconcile complete: desired_v4={}, removed_v4={}",
+        manager.get_routes().len(),
+        removed_v4
+    );
+}
+
+fn contains_route(routes: &[Route], route: &Route) -> bool {
+    routes
+        .iter()
+        .any(|existing| ip_route::route_equal(existing, route))
 }
 
 fn subnet_file_path() -> String {

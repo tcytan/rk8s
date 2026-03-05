@@ -60,16 +60,29 @@ impl NodeRegistry {
         };
 
         if let Some(session) = session {
-            let cleanup_rules = build_delete_table_ruleset();
-            if let Err(e) = session
-                .tx
-                .try_send(RksMessage::SetNftablesRules(cleanup_rules))
-            {
-                warn!("Failed to send nftables cleanup to node {}: {}", node_id, e);
-            }
-
-            session.cancel_notify.notify_one();
+            Self::cleanup_session(node_id, session);
         }
+    }
+
+    pub async fn unregister_if_matches(
+        &self,
+        node_id: &str,
+        expected: &Arc<WorkerSession>,
+    ) -> bool {
+        let session = {
+            let mut inner = self.inner.lock().await;
+            match inner.get(node_id) {
+                Some(current) if Arc::ptr_eq(current, expected) => inner.remove(node_id),
+                _ => None,
+            }
+        };
+
+        if let Some(session) = session {
+            Self::cleanup_session(node_id, session);
+            return true;
+        }
+
+        false
     }
 
     pub async fn get(&self, node_id: &str) -> Option<Arc<WorkerSession>> {
@@ -81,6 +94,18 @@ impl NodeRegistry {
     pub async fn list_sessions(&self) -> Vec<(String, Arc<WorkerSession>)> {
         let inner = self.inner.lock().await;
         inner.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+    }
+
+    fn cleanup_session(node_id: &str, session: Arc<WorkerSession>) {
+        let cleanup_rules = build_delete_table_ruleset();
+        if let Err(e) = session
+            .tx
+            .try_send(RksMessage::SetNftablesRules(cleanup_rules))
+        {
+            warn!("Failed to send nftables cleanup to node {}: {}", node_id, e);
+        }
+
+        session.cancel_notify.notify_one();
     }
 }
 
@@ -113,13 +138,13 @@ impl RksNode {
     pub async fn run(self) -> anyhow::Result<()> {
         info!("Starting server with address: {}", self.addr);
 
-        self.start_background_tasks().await;
+        self.start_background_tasks();
 
         let server = QUICServer::new(self.addr.parse()?, self.shared.vault.clone()).await?;
         server.serve(self.shared.clone()).await
     }
 
-    async fn start_background_tasks(&self) {
+    fn start_background_tasks(&self) {
         // Check if lastheartbeattime times out
         heartbeat::watch(
             self.shared.xline_store.clone(),
@@ -128,11 +153,13 @@ impl RksNode {
         );
         info!("Heartbeat monitor started");
 
-        if let Err(e) = local_node::bootstrap(self.shared.clone(), &self.addr).await {
-            warn!("Failed to bootstrap local rks node networking: {e:#}");
-        } else {
-            info!("Local rks node networking bootstrap completed");
-        }
+        let shared_clone = self.shared.clone();
+        let addr_clone = self.addr.clone();
+        tokio::spawn(async move {
+            if let Err(e) = local_node::bootstrap(shared_clone, &addr_clone).await {
+                warn!("Failed to bootstrap local rks node networking: {e:#}");
+            }
+        });
 
         // Spawn task to propagate lease updates to workers
         LeaseSynchronizer::spawn(
